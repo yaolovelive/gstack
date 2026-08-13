@@ -1,0 +1,232 @@
+#!/usr/bin/env bun
+
+import { parseArgs } from 'node:util';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+type Status =
+  | 'ok'
+  | 'not_installed'
+  | 'not_configured'
+  | 'timeout'
+  | 'nonzero_exit'
+  | 'session_not_found'
+  | 'invalid_export'
+  | 'empty_response'
+  | 'write_detected';
+
+type Result = {
+  status: Status;
+  session_id?: string;
+  text?: string;
+  reasoning?: string;
+  tokens?: {
+    input: number;
+    output: number;
+    reasoning: number;
+    cache_read: number;
+    cache_write: number;
+  };
+  cost?: number;
+  provider?: string;
+  model?: string;
+  finish?: string;
+  error?: string;
+};
+
+type CommandResult = {
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+};
+
+function redact(value: string): string {
+  return value
+    .replace(/\b(token|secret|password|api[_-]?key)=\S+/gi, '$1=[REDACTED]')
+    .replace(/\b(sk|key|token)-[A-Za-z0-9_-]{8,}\b/g, '[REDACTED]')
+    .slice(0, 1000);
+}
+
+function emit(result: Result): never {
+  console.log(JSON.stringify(result));
+  process.exit(result.status === 'ok' ? 0 : 1);
+}
+
+async function run(command: string, args: string[], timeoutSeconds: number): Promise<CommandResult> {
+  const proc = Bun.spawn([command, ...args], {
+    stdin: 'ignore',
+    stdout: 'pipe',
+    stderr: 'pipe',
+    env: process.env,
+  });
+  const stdoutPromise = new Response(proc.stdout).text();
+  const stderrPromise = new Response(proc.stderr).text();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill();
+  }, timeoutSeconds * 1000);
+  const exitCode = await proc.exited;
+  clearTimeout(timer);
+  return {
+    exitCode,
+    stdout: await stdoutPromise,
+    stderr: await stderrPromise,
+    timedOut,
+  };
+}
+
+function parseExport(raw: string, includeReasoning: boolean): Result {
+  const jsonStart = raw.indexOf('{');
+  if (jsonStart < 0) return { status: 'invalid_export', error: 'OpenCode export did not contain JSON.' };
+
+  let exported: any;
+  try {
+    exported = JSON.parse(raw.slice(jsonStart));
+  } catch (error) {
+    return { status: 'invalid_export', error: redact(`OpenCode export was invalid JSON: ${error}`) };
+  }
+
+  const info = exported?.info ?? {};
+  const summary = info.summary ?? {};
+  if ((summary.additions ?? 0) > 0 || (summary.deletions ?? 0) > 0 || (summary.files ?? 0) > 0) {
+    return {
+      status: 'write_detected',
+      session_id: info.id,
+      error: 'OpenCode reported repository file changes during a read-only run.',
+    };
+  }
+
+  const messages = Array.isArray(exported?.messages) ? exported.messages : [];
+  const assistantMessages = messages
+    .filter((message: any) => message?.info?.role === 'assistant')
+    .sort((a: any, b: any) => (a?.info?.time?.completed ?? 0) - (b?.info?.time?.completed ?? 0));
+  const assistant = assistantMessages.at(-1);
+  const parts = Array.isArray(assistant?.parts) ? assistant.parts : [];
+  const text = parts
+    .filter((part: any) => part?.type === 'text' && typeof part.text === 'string')
+    .map((part: any) => part.text.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  if (!text) {
+    return { status: 'empty_response', session_id: info.id, error: 'OpenCode returned no assistant text.' };
+  }
+
+  const reasoning = parts
+    .filter((part: any) => part?.type === 'reasoning' && typeof part.text === 'string')
+    .map((part: any) => part.text.trim())
+    .filter(Boolean)
+    .join('\n\n');
+  const tokens = info.tokens ?? assistant?.info?.tokens ?? {};
+  const modelInfo = info.model ?? {};
+  const result: Result = {
+    status: 'ok',
+    session_id: info.id,
+    text,
+    tokens: {
+      input: tokens.input ?? 0,
+      output: tokens.output ?? 0,
+      reasoning: tokens.reasoning ?? 0,
+      cache_read: tokens.cache?.read ?? 0,
+      cache_write: tokens.cache?.write ?? 0,
+    },
+    cost: info.cost ?? assistant?.info?.cost ?? 0,
+    provider: modelInfo.providerID ?? assistant?.info?.providerID,
+    model: modelInfo.id ?? modelInfo.modelID ?? assistant?.info?.modelID,
+    finish: assistant?.info?.finish,
+  };
+  if (includeReasoning && reasoning) result.reasoning = reasoning;
+  return result;
+}
+
+async function main(): Promise<never> {
+  let values: Record<string, string | boolean | undefined>;
+  try {
+    ({ values } = parseArgs({
+      options: {
+        mode: { type: 'string' },
+        'prompt-file': { type: 'string' },
+        repo: { type: 'string' },
+        timeout: { type: 'string', default: '600' },
+        session: { type: 'string' },
+        model: { type: 'string' },
+        variant: { type: 'string' },
+        thinking: { type: 'boolean', default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    }) as { values: Record<string, string | boolean | undefined> });
+  } catch (error) {
+    return emit({ status: 'nonzero_exit', error: redact(`Invalid arguments: ${error}`) });
+  }
+
+  const promptFile = values['prompt-file'];
+  const repo = values.repo;
+  const timeoutSeconds = Number(values.timeout);
+  if (typeof values.mode !== 'string' || typeof promptFile !== 'string' || typeof repo !== 'string') {
+    return emit({ status: 'nonzero_exit', error: 'Required arguments: --mode, --prompt-file, and --repo.' });
+  }
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+    return emit({ status: 'nonzero_exit', error: '--timeout must be a positive number of seconds.' });
+  }
+  if (!fs.existsSync(promptFile) || !fs.statSync(promptFile).isFile()) {
+    return emit({ status: 'nonzero_exit', error: `Prompt file not found: ${path.basename(promptFile)}` });
+  }
+  if (!fs.existsSync(repo) || !fs.statSync(repo).isDirectory()) {
+    return emit({ status: 'nonzero_exit', error: `Repository directory not found: ${path.basename(repo)}` });
+  }
+
+  const configuredBinary = process.env.GSTACK_OPENCODE_BIN;
+  const opencode = configuredBinary || Bun.which('opencode');
+  if (!opencode || !fs.existsSync(opencode)) {
+    return emit({ status: 'not_installed', error: 'OpenCode CLI was not found. Install it and retry.' });
+  }
+
+  const prompt = fs.readFileSync(promptFile, 'utf8');
+  const session = typeof values.session === 'string' ? values.session : undefined;
+  const uniqueTitle = `gstack-opencode-${process.pid}-${Date.now().toString(36)}`;
+  const runArgs = ['run', '--agent', 'plan', '--dir', path.resolve(repo)];
+  if (session) runArgs.push('--session', session);
+  else runArgs.push('--title', uniqueTitle);
+  if (typeof values.model === 'string') runArgs.push('--model', values.model);
+  if (typeof values.variant === 'string') runArgs.push('--variant', values.variant);
+  if (values.thinking === true) runArgs.push('--thinking');
+  runArgs.push(prompt);
+
+  const invocation = await run(opencode, runArgs, timeoutSeconds);
+  if (invocation.timedOut) {
+    return emit({ status: 'timeout', error: `OpenCode timed out after ${timeoutSeconds} seconds.` });
+  }
+  if (invocation.exitCode !== 0) {
+    const error = redact(invocation.stderr || invocation.stdout || `OpenCode exited ${invocation.exitCode}.`);
+    const authFailure = /auth|login|credential|provider.+configur|unauthorized/i.test(error);
+    return emit({ status: authFailure ? 'not_configured' : 'nonzero_exit', error });
+  }
+
+  let sessionId = session;
+  if (!sessionId) {
+    const sessions = await run(opencode, ['session', 'list'], Math.min(timeoutSeconds, 30));
+    if (sessions.exitCode === 0) {
+      const matching = sessions.stdout
+        .split('\n')
+        .filter(line => line.includes(uniqueTitle))
+        .map(line => line.trim().match(/^(ses_[^\s]+)/)?.[1])
+        .filter((id): id is string => Boolean(id));
+      if (matching.length === 1) sessionId = matching[0];
+    }
+  }
+  if (!sessionId) {
+    return emit({ status: 'session_not_found', error: 'OpenCode completed but the new session could not be resolved.' });
+  }
+
+  const exported = await run(opencode, ['export', sessionId], Math.min(timeoutSeconds, 30));
+  if (exported.exitCode !== 0) {
+    return emit({ status: 'invalid_export', session_id: sessionId, error: redact(exported.stderr || exported.stdout) });
+  }
+  const result = parseExport(exported.stdout, values.thinking === true);
+  if (!result.session_id) result.session_id = sessionId;
+  return emit(result);
+}
+
+await main();
