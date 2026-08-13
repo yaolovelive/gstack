@@ -57,6 +57,10 @@ describe('hosts/index.ts', () => {
     expect(openclaw.name).toBe('openclaw');
   });
 
+  test('OpenCode suppresses recursive outside-voice skills', () => {
+    expect(opencode.generation.skipSkills).toEqual(['codex', 'opencode']);
+  });
+
   test('getHostConfig returns correct config', () => {
     const c = getHostConfig('codex');
     expect(c.name).toBe('codex');
