@@ -178,6 +178,11 @@
       "routing": "Opens a visible browser window where you can watch every action in real time.\nThe sidebar shows a live activity feed and chat. Anti-bot stealth built in.\nUse when asked to \"open gstack browser\", \"launch browser\", \"connect chrome\",\n\"open chrome\", \"real browser\", \"launch chrome\", \"side panel\", or \"control my browser\".",
       "voice_line": "Voice triggers (speech-to-text aliases): \"show me the browser\"."
     },
+    "opencode": {
+      "lead": "OpenCode CLI outside voice for independent second-opinion review, challenge, and consult workflows.",
+      "routing": "Use when asked to \"ask OpenCode\", \"OpenCode review\",\n\"OpenCode challenge\", \"OpenCode consult\", \"OpenCode rescue\", or to get a\ncross-model review from OpenCode.",
+      "voice_line": null
+    },
     "pair-agent": {
       "lead": "Pair a remote AI agent with your browser.",
       "routing": "One command generates a setup key and\nprints instructions the other agent can follow to connect. Works with OpenClaw,\nHermes, Codex, Cursor, or any agent that can make HTTP requests. The remote agent\ngets its own tab with scoped access (read+write by default, admin on request).\nUse when asked to \"pair agent\", \"connect agent\", \"share browser\", \"remote browser\",\n\"let another agent use my browser\", or \"give browser access\".",

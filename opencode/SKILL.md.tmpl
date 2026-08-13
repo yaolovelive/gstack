@@ -1,0 +1,342 @@
+---
+name: opencode
+preamble-tier: 3
+version: 1.0.0
+description: |
+  OpenCode CLI outside voice for independent second-opinion review, challenge,
+  and consult workflows. Use when asked to "ask OpenCode", "OpenCode review",
+  "OpenCode challenge", "OpenCode consult", "OpenCode rescue", or to get a
+  cross-model review from OpenCode. (gstack)
+triggers:
+  - opencode review
+  - opencode challenge
+  - opencode consult
+  - ask opencode
+  - opencode rescue
+allowed-tools:
+  - Bash
+  - Read
+  - Write
+  - AskUserQuestion
+---
+
+{{PREAMBLE}}
+
+{{BASE_BRANCH_DETECT}}
+
+# /opencode — OpenCode Outside Voice
+
+Use OpenCode as an independent read-only reviewer. OpenCode supplies evidence;
+the current host remains responsible for validation and the final decision.
+
+Always show OpenCode's **full output verbatim before synthesis**. Never replace
+the outside voice with a summary.
+
+---
+
+## Step 0: Locate the adapter
+
+```bash
+OPENCODE_RUNNER="$HOME/.claude/skills/gstack/bin/gstack-opencode-run"
+[ -x "$OPENCODE_RUNNER" ] || OPENCODE_RUNNER=".claude/skills/gstack/bin/gstack-opencode-run"
+[ -x "$OPENCODE_RUNNER" ] || { echo "ERROR: gstack-opencode-run not found. Re-run gstack setup." >&2; exit 1; }
+```
+
+The generated host version rewrites these paths to its own gstack runtime.
+
+Do not call `opencode run` directly. The adapter enforces the plan agent,
+resolves sessions, parses exports, redacts errors, detects writes, and returns a
+stable JSON contract.
+
+---
+
+## Safety Boundary
+
+OpenCode is an outside voice, not an implementer.
+
+- Every invocation is read-only.
+- The adapter always uses `--agent plan` and never uses `--auto`.
+- Never tell OpenCode to edit, fix, commit, push, or invoke another agent.
+- Never ask OpenCode to read or execute gstack skill definitions under
+  `~/.claude/`, `~/.codex/`, `~/.agents/`, `.claude/`, `.agents/`, or
+  `.opencode/skills/`.
+- Treat `write_detected` as a failed run. Do not use the response as approval.
+- Write prompts to a temp file with the file-writing tool. Never interpolate
+  user-provided text into a shell command.
+
+Every prompt begins with this boundary:
+
+```text
+IMPORTANT: This is a read-only outside-voice task. Inspect and report only.
+Do not edit files, apply patches, create commits, or launch another coding agent.
+Do not read or execute AI skill definitions under ~/.claude/, ~/.codex/,
+~/.agents/, .claude/, .agents/, or .opencode/skills/. Stay focused on repository
+code and the exact question below.
+```
+
+---
+
+## Step 1: Parse mode and flags
+
+Recognize these forms:
+
+1. `/opencode review [instructions]` → **Review Mode**
+2. `/opencode challenge [focus]` → **Challenge Mode**
+3. `/opencode consult [question]` → **Consult Mode**
+4. `/opencode rescue [problem]` → **Consult Mode** with an independent recovery diagnosis
+5. `/opencode` or `/opencode <anything else>` → **Consult Mode**
+
+Recognize and remove these flags before constructing the mode prompt:
+
+- `--model <provider/model>`: pass through unchanged.
+- `--variant <name>`: pass through unchanged.
+- `--thinking`: request reasoning parts in the normalized response.
+
+Review and Challenge use an implicit `--variant high` only when the user did not
+provide a variant. If OpenCode explicitly rejects that implicit variant, retry
+once without it. Never remove or alter an explicit user variant.
+
+If the request could reasonably mean either review or consult, ask one concise
+AskUserQuestion. Do not guess the scope.
+
+---
+
+## Shared invocation
+
+Resolve the repository and temp root:
+
+```bash
+REPO_ROOT=$(git rev-parse --show-toplevel) || { echo "ERROR: not in a git repository" >&2; exit 1; }
+eval "$("$HOME/.claude/skills/gstack/bin/gstack-paths" 2>/dev/null || .claude/skills/gstack/bin/gstack-paths)"
+TMP_ROOT="${TMP_ROOT:-${TMPDIR:-/tmp}}"
+PROMPT_FILE=$(mktemp "$TMP_ROOT/gstack-opencode-prompt-XXXXXX.txt")
+RESULT_FILE=$(mktemp "$TMP_ROOT/gstack-opencode-result-XXXXXX.json")
+```
+
+Use the file-writing tool to place the complete prompt in `PROMPT_FILE`.
+
+Build the adapter call from parsed values. Omit optional arguments that were not
+selected:
+
+```bash
+"$OPENCODE_RUNNER" \
+  --mode "<review|challenge|consult>" \
+  --prompt-file "$PROMPT_FILE" \
+  --repo "$REPO_ROOT" \
+  --timeout 600 \
+  [--session "<session-id>"] \
+  [--model "<provider/model>"] \
+  [--variant "<variant>"] \
+  [--thinking] > "$RESULT_FILE" || true
+```
+
+Read the final JSON line from `RESULT_FILE`. It has this contract:
+
+```json
+{
+  "status": "ok",
+  "session_id": "ses_...",
+  "text": "full assistant response",
+  "reasoning": "optional reasoning text",
+  "tokens": {
+    "input": 0,
+    "output": 0,
+    "reasoning": 0,
+    "cache_read": 0,
+    "cache_write": 0
+  },
+  "cost": 0,
+  "provider": "provider-id",
+  "model": "model-id",
+  "finish": "stop"
+}
+```
+
+Cleanup after the result has been read:
+
+```bash
+rm -f "$PROMPT_FILE" "$RESULT_FILE"
+```
+
+---
+
+## Review Mode
+
+Review the current branch against the detected base branch.
+
+1. Ensure a diff exists:
+
+```bash
+git fetch origin <base> --quiet 2>/dev/null || true
+git diff --quiet "origin/<base>" 2>/dev/null && git diff --quiet "<base>" 2>/dev/null
+```
+
+If both comparisons are empty, stop: "Nothing to review — no changes against
+the base branch."
+
+2. Write this prompt, including any additional user instructions:
+
+```text
+<filesystem boundary>
+
+Review the changes on this branch against origin/<base>. Run git diff to inspect
+the exact patch. Find correctness bugs, regressions, security issues, unsafe data
+migrations, missing tests, and production failure modes. Report only actionable
+findings. For each finding include severity, file and line, evidence, impact, and
+the smallest safe correction. If there are no findings, say so explicitly.
+
+Additional instructions:
+<user instructions or "none">
+```
+
+3. Invoke the adapter with `--mode review` and the selected model/variant flags.
+
+4. On `ok`, present:
+
+```text
+OPENCODE SAYS (code review):
+════════════════════════════════════════════════════════════
+<reasoning, only when --thinking was requested>
+<text, full output verbatim>
+════════════════════════════════════════════════════════════
+Provider: <provider> | Model: <model> | Tokens: input=<input> output=<output> reasoning=<reasoning> cache_read=<cache_read> | Cost: <cost>
+```
+
+5. Validate findings against the diff. Then emit exactly one synthesis line:
+
+```text
+Recommendation: <action> because <specific highest-impact validated finding compared with the alternative>.
+```
+
+---
+
+## Challenge Mode
+
+Run an adversarial review over the same branch diff.
+
+1. Use the Review Mode diff check.
+
+2. Write this prompt:
+
+```text
+<filesystem boundary>
+
+Review the changes on this branch against origin/<base>. Act as an attacker,
+chaos engineer, and production incident reviewer. Find security exploits, race
+conditions, resource leaks, corrupt state transitions, unbounded work, bad retry
+behavior, partial-failure hazards, observability gaps, and silent data loss.
+Report concrete failure paths with file and line evidence. No compliments.
+
+Focus area:
+<user focus or "all production failure modes">
+```
+
+3. Invoke with `--mode challenge`, using the same implicit-variant rules as
+Review Mode.
+
+4. Present the result under `OPENCODE SAYS (adversarial challenge):`, with the
+same full-output and metadata contract.
+
+5. Validate the strongest failure path, then emit one specific `Recommendation:`
+line comparing fix-now against shipping or another finding.
+
+---
+
+## Consult Mode
+
+Ask OpenCode a free-form codebase question, review a plan, or request rescue
+when the current host is stuck.
+
+### Session continuation
+
+Read `.context/opencode-session-id` if present. If it contains a session ID, ask:
+
+```text
+An OpenCode consult session already exists for this repository. Continue it or start fresh?
+A) Continue — retain OpenCode's earlier context.
+B) Start fresh — create an independent session.
+```
+
+Use `--session <id>` only for Continue. Never delete the saved ID automatically
+when resume fails.
+
+### Prompt
+
+For a normal consult, write:
+
+```text
+<filesystem boundary>
+
+You are a brutally honest technical consultant. Answer the question using
+repository evidence. Identify assumptions, cite relevant files and lines, compare
+viable approaches, and give a concrete recommendation. Do not modify anything.
+
+Question:
+<full user question>
+```
+
+For rescue, add:
+
+```text
+The primary agent is stuck. Independently diagnose the root cause, identify what
+evidence would disprove your diagnosis, and propose the smallest next step. Do
+not implement the fix.
+```
+
+For plan review, read the plan yourself and embed its full content in the prompt.
+Do not give OpenCode an external plan path it cannot access. Also list referenced
+repository source files that OpenCode should inspect.
+
+### Result
+
+Invoke with `--mode consult`. Do not add an implicit variant. On a successful new
+session:
+
+```bash
+mkdir -p .context
+printf '%s\n' "<session_id>" > .context/opencode-session-id
+```
+
+Present under `OPENCODE SAYS (consult):` using the full-output and metadata
+contract, followed by:
+
+```text
+Session saved — run /opencode again to continue this conversation.
+Recommendation: <action> because <specific OpenCode insight compared with the strongest alternative>.
+```
+
+If the current host disagrees, state the disagreement after the verbatim block
+and explain it with repository evidence.
+
+---
+
+## Error Contract
+
+Map adapter statuses exactly:
+
+| Status | Required response |
+|---|---|
+| `not_installed` | "OpenCode CLI not found. Install OpenCode and retry." |
+| `not_configured` | "OpenCode has no usable provider credentials. Run `opencode auth login` or configure a provider, then retry." |
+| `timeout` | Report the timeout; recommend retrying with a smaller scope. |
+| `nonzero_exit` | Show the adapter's bounded redacted error. |
+| `session_not_found` | Explain that OpenCode ran but the created session could not be resolved. |
+| `invalid_export` | Explain that the installed OpenCode export format was not parseable. |
+| `empty_response` | Explain that the session contained no assistant response. |
+| `write_detected` | Warn that OpenCode violated the read-only boundary; reject the run as evidence. |
+
+Never synthesize a successful recommendation from an error result. Preserve the
+saved consult session ID after resume errors so the user can inspect or retry it.
+
+---
+
+## Important Rules
+
+- Keep OpenCode read-only; the current host performs any later implementation.
+- Present the full output verbatim before synthesis.
+- Add synthesis after, never instead of, the outside-voice response.
+- Preserve explicit `--model` and `--variant` values exactly.
+- Do not silently retry an explicit variant.
+- Do not expose secrets, auth files, or full environment data.
+- Do not call `/opencode` from OpenCode itself.
+- Do not treat an outside voice as authoritative without repository evidence.
