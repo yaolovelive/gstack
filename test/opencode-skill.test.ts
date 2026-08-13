@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { codex, opencode as opencodeHost } from '../hosts';
 
 const ROOT = path.resolve(import.meta.dir, '..');
 const TEMPLATE = path.join(ROOT, 'opencode', 'SKILL.md.tmpl');
@@ -58,7 +59,12 @@ describe('/opencode outside-voice skill', () => {
   });
 
   test('generates for Codex but not recursively for OpenCode', () => {
-    expect(fs.existsSync(path.join(ROOT, '.agents', 'skills', 'gstack-opencode', 'SKILL.md'))).toBe(true);
-    expect(fs.existsSync(path.join(ROOT, '.opencode', 'skills', 'gstack-opencode', 'SKILL.md'))).toBe(false);
+    expect(codex.generation.skipSkills ?? []).not.toContain('opencode');
+    expect(opencodeHost.generation.skipSkills).toContain('opencode');
+  });
+
+  test('is discoverable in the README implementation and review catalog', () => {
+    const readme = read(path.join(ROOT, 'README.md'));
+    expect(readme).toContain('| `/opencode` | Second opinion via OpenCode. Review, challenge, or consult modes. |');
   });
 });
