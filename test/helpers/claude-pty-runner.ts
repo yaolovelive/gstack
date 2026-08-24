@@ -21,10 +21,11 @@
  * tests don't need it).
  */
 
+import { resolveEvalModel } from '../../lib/eval-model';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { hermeticChildEnv, isHermeticEnabled } from './hermetic-env';
+import { hermeticChildEnv, hermeticSkillsConfigDir, isHermeticEnabled } from './hermetic-env';
 
 /** Strip ANSI escapes for pattern-matching against visible text. */
 export function stripAnsi(s: string): string {
@@ -61,6 +62,11 @@ export function resolveClaudeBinary(): string | null {
 }
 
 export interface ClaudePtyOptions {
+  /** Register the repo's shipped skills in the child's user scope via
+   * hermeticSkillsConfigDir(). Required by any test that types a /skill
+   * slash command; without it hermetic claude rejects the command as
+   * Unknown before any model turn. No effect when EVALS_HERMETIC=0. */
+  seedSkills?: boolean;
   /**
    * Permission mode for the session.
    *  - 'plan' (default) — launches with --permission-mode plan
@@ -300,6 +306,17 @@ export function isPermissionDialogVisible(visible: string): boolean {
 }
 
 /** Detect any AskUserQuestion-shaped numbered option list with cursor. */
+/**
+ * Strip terminal residue that survives ANSI-stripping and can interleave
+ * with AUQ text: DEC cursor-visibility fragments (`[?25l` / `[?25h` — the ESC
+ * byte is gone but the bracket sequence remains) and the spinner frames
+ * rendered between them. Observed in plan-design-with-ui's failure buffer,
+ * where `[?25l✻Sprouting…[?25h` fragments sat inside the option lines.
+ */
+export function stripPtyResidue(visible: string): string {
+  return visible.replace(/\[\?25[lh]/g, '');
+}
+
 export function isNumberedOptionListVisible(visible: string): boolean {
   // ❯ cursor + at least two numbered options 1-9.
   // Matches the trust dialog AND plan-ready prompt AND skill questions.
@@ -311,7 +328,8 @@ export function isNumberedOptionListVisible(visible: string): boolean {
   // because `t-2` is a word-to-word transition. We use the weaker
   // `[^0-9]2\.` to require a non-digit before `2` (so we don't match
   // `12.0`) without requiring whitespace.
-  return /❯\s*1\./.test(visible) && /(^|[^0-9])2\./.test(visible);
+  const cleaned = stripPtyResidue(visible);
+  return /❯\s*1\./.test(cleaned) && /(^|[^0-9])2\./.test(cleaned);
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -437,9 +455,12 @@ ${tail}
   };
 
   try {
+    // Use the same binary resolution as every PTY launch in this file —
+    // judgePtyState previously hardcoded bare 'claude' three definitions
+    // below resolveClaudeBinary(), breaking under hermetic PATHs.
     const result = nodeSpawnSync(
-      'claude',
-      ['-p', '--model', 'claude-haiku-4-5', '--max-turns', '1'],
+      resolveClaudeBinary() ?? 'claude',
+      ['-p', '--model', resolveEvalModel('warmup'), '--max-turns', '1'],
       {
         input: prompt,
         stdio: ['pipe', 'pipe', 'pipe'],
@@ -687,6 +708,7 @@ export function isScopeGateAutoSelectVisible(visible: string): boolean {
 export function parseNumberedOptions(
   visible: string,
 ): Array<{ index: number; label: string }> {
+  visible = stripPtyResidue(visible);
   const tail = visible.length > 4096 ? visible.slice(-4096) : visible;
   // Split on lines, look for `❯ N.` or `  N.` patterns. Up to N=9.
   // The `\s*` after `.` (not `\s+`) is required because stripAnsi removes
@@ -728,30 +750,41 @@ export function parseNumberedOptions(
   const seenIndices = new Set<number>();
 
   // Cursor line: option 1 may be inline after box dividers + prompt header
-  // (`...divider...header...❯1. label`). Use a non-anchored regex that
-  // captures `❯N. label` from anywhere on the line through end-of-line.
-  // Only used for the cursor line — subsequent options are parsed with the
-  // start-of-line `optionRe`.
+  // (`...divider...header...❯1. label`) — and, when the PTY reflows the whole
+  // AUQ onto ONE logical line, options 2..N sit on the SAME line after it
+  // (observed with /plan-design-review's Step-0 scope gate: `❯1.Branch diff
+  // ... 2.Plan or design doc ... 5.Chat about this ... Enter to select`).
+  // Parse the cursor line as a STREAM: find every `N.` token (not preceded
+  // by a digit, not followed by one — excludes "12." and "1.5"), require
+  // ascending indices starting from the cursor's option, and take each
+  // label as the text between successive number tokens.
   const cursorLine = lines[cursorLineIdx] ?? '';
-  const cursorInlineRe = /❯\s*([1-9])\.\s*(\S.*?)\s*$/;
-  const inlineMatch = cursorInlineRe.exec(cursorLine);
-  if (inlineMatch) {
-    const idx = Number(inlineMatch[1]);
-    const label = (inlineMatch[2] ?? '').trim();
-    if (label.length > 0 && !seenIndices.has(idx)) {
-      seenIndices.add(idx);
-      found.push({ index: idx, label });
-    }
-  } else {
-    // No inline cursor match — fall back to start-of-line regex.
-    const startMatch = optionRe.exec(cursorLine);
-    if (startMatch) {
-      const idx = Number(startMatch[1]);
-      const label = (startMatch[2] ?? '').trim();
-      if (label.length > 0 && !seenIndices.has(idx)) {
-        seenIndices.add(idx);
-        found.push({ index: idx, label });
-      }
+  const cursorStart = cursorLine.indexOf('❯');
+  const cursorSegment = cursorStart >= 0 ? cursorLine.slice(cursorStart) : cursorLine;
+  const tokenRe = /(?:^|[^0-9])([1-9])\.(?!\d)\s*/g;
+  const tokens: Array<{ idx: number; labelStart: number; matchStart: number }> = [];
+  for (let m = tokenRe.exec(cursorSegment); m !== null; m = tokenRe.exec(cursorSegment)) {
+    tokens.push({
+      idx: Number(m[1]),
+      labelStart: m.index + m[0].length,
+      matchStart: m.index === 0 ? 0 : m.index + 1, // skip the [^0-9] guard char
+    });
+  }
+  // Keep only the ascending run that starts the sequence (1, 2, 3, ...);
+  // stray numbers inside labels break ascension and end the run.
+  let expected = 1;
+  for (let t = 0; t < tokens.length; t++) {
+    const token = tokens[t]!;
+    if (token.idx !== expected) continue;
+    const next = tokens
+      .slice(t + 1)
+      .find((candidate) => candidate.idx === expected + 1 && candidate.matchStart > token.labelStart);
+    const labelEnd = next ? next.matchStart : cursorSegment.length;
+    const label = cursorSegment.slice(token.labelStart, labelEnd).trim();
+    if (label.length > 0 && !seenIndices.has(token.idx)) {
+      seenIndices.add(token.idx);
+      found.push({ index: token.idx, label });
+      expected += 1;
     }
   }
 
@@ -1224,7 +1257,15 @@ export const ceoStep0Boundary: Step0BoundaryPredicate = (fp) =>
 export const engStep0Boundary: Step0BoundaryPredicate = (fp) =>
   /scope reduction recommendation|cross[\s-]?project learnings/i.test(
     fp.promptSnippet,
-  );
+  ) ||
+  // plan-eng-review's Step 0 may legitimately end with NO scope-reduction /
+  // learnings AUQ. When it does, the first answered review-phase question —
+  // tagged <gstack-qid:plan-eng-review-...> ({skill}-{slug} convention) —
+  // must fire the boundary, or every per-finding AUQ stays classified
+  // preReview and the multi-finding batching counter reads 0. Anchor allows
+  // the skill-name prefix; live qids observed: plan-eng-review-jitter,
+  // plan-eng-review-idempotency, plan-eng-review-todos-e2e-concurrent.
+  /gstack-qid:\s*(?:plan-)?eng-review-/i.test(fp.promptSnippet);
 
 export const designStep0Boundary: Step0BoundaryPredicate = (fp) =>
   /design system|design posture|design score|first dimension/i.test(
@@ -1285,6 +1326,9 @@ export async function launchClaudePty(
   // Hermetic by default (test/helpers/hermetic-env.ts): operator session
   // context never reaches the child; per-test opts.env merges last.
   const childEnv = hermeticChildEnv(opts.env);
+  if (opts.seedSkills && hermetic && !opts.env?.CLAUDE_CONFIG_DIR) {
+    childEnv.CLAUDE_CONFIG_DIR = hermeticSkillsConfigDir();
+  }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const proc = (Bun as any).spawn([claudePath, ...args], {
@@ -1670,6 +1714,7 @@ export async function runPlanSkillObservation(opts: {
     extraArgs: opts.extraArgs,
     env: opts.env,
     model: opts.model,
+    seedSkills: true,
   });
 
   try {
@@ -1966,6 +2011,7 @@ export async function runPlanSkillCounting(opts: {
     timeoutMs: timeoutMs + 60_000,
     env: opts.env,
     model: opts.model,
+    seedSkills: true,
   });
 
   const fingerprints: AskUserQuestionFingerprint[] = [];
@@ -2199,6 +2245,7 @@ export async function runPlanSkillFloorCheck(opts: {
     timeoutMs: timeoutMs + 60_000,
     env: opts.env,
     model: opts.model,
+    seedSkills: true,
   });
 
   try {
