@@ -1938,6 +1938,10 @@ describe('Codex generation (--host codex)', () => {
   test('no ~/.claude/ paths in Codex output', () => {
     for (const skill of CODEX_SKILLS) {
       const content = fs.readFileSync(path.join(AGENTS_DIR, skill.codexName, 'SKILL.md'), 'utf-8');
+      // gstack-opencode's Safety Boundary deliberately enumerates foreign
+      // AI-skill roots (~/.claude/, ~/.codex/, ~/.agents/) to keep the
+      // outside voice out of host skill definitions.
+      if (skill.dir === 'opencode') continue;
       expect(content).not.toContain('~/.claude/');
     }
   });
@@ -2198,8 +2202,10 @@ describe('Codex generation (--host codex)', () => {
       // logs, referenced by the review/ship timeout guidance) and
       // ~/.codex/config.toml (the model_unusable guidance in the shared
       // codexPreflight, #2477) are the same user-facing class, so they are
-      // scrubbed before the ban.
-      if (skill.dir !== 'pair-agent' && skill.dir !== 'codex' && skill.dir !== 'autoplan') {
+      // scrubbed before the ban. opencode's Safety Boundary names ~/.codex/
+      // for the same reason it names ~/.claude/ — keeping the outside voice
+      // out of foreign AI-skill roots, not pointing at a Codex install path.
+      if (skill.dir !== 'pair-agent' && skill.dir !== 'codex' && skill.dir !== 'autoplan' && skill.dir !== 'opencode') {
         expect(
           content
             .replaceAll('~/.codex/sessions/', '')

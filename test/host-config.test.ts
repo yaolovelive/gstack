@@ -562,6 +562,34 @@ describe('host config correctness', () => {
     expect(openclaw.toolRewrites!['use the Read tool']).toBe('use the read tool');
   });
 
+  test('opencode has tool rewrites mapping Claude tools to OpenCode tools', () => {
+    expect(opencode.toolRewrites).toBeDefined();
+    expect(opencode.toolRewrites!['AskUserQuestion']).toBe('question');
+    expect(opencode.toolRewrites!['Skill tool']).toBe('skill tool');
+    expect(opencode.toolRewrites!['Agent tool']).toBe('task tool');
+    expect(opencode.toolRewrites!['WebSearch']).toBe('websearch');
+    expect(opencode.toolRewrites!['the Bash tool']).toBe('the bash tool');
+    expect(opencode.toolRewrites!['the Read tool']).toBe('the read tool');
+  });
+
+  test('opencode tool rewrite order protects MCP AUQ names and ExitPlanMode phrasing', () => {
+    const keys = Object.keys(opencode.toolRewrites!);
+    // The MCP-suffix sentinel must park BEFORE the global AUQ rewrite and be
+    // restored AFTER it, or `mcp__conductor__AskUserQuestion` gets mangled.
+    expect(keys.indexOf('__AskUserQuestion')).toBeLessThan(keys.indexOf('AskUserQuestion'));
+    expect(keys.indexOf('AskUserQuestion')).toBeLessThan(keys.indexOf('@@GSTACK-MCP-AUQ@@'));
+    // ExitPlanMode phrases must rewrite before the bare token to stay grammatical.
+    expect(keys.indexOf('call ExitPlanMode')).toBeLessThan(keys.indexOf('ExitPlanMode'));
+    expect(keys.indexOf('calling ExitPlanMode')).toBeLessThan(keys.indexOf('ExitPlanMode'));
+
+    // Simulate applyHostRewrites ordering over a representative sentence mix.
+    let out = 'call ExitPlanMode before ExitPlanMode is called; calling ExitPlanMode beats firing AskUserQuestion next to mcp__conductor__AskUserQuestion';
+    for (const [from, to] of Object.entries(opencode.toolRewrites!)) {
+      out = out.replaceAll(from, to);
+    }
+    expect(out).toBe('end plan mode before plan mode ends; ending plan mode beats firing question next to mcp__conductor__AskUserQuestion');
+  });
+
   test('openclaw has CLAUDE.md→AGENTS.md path rewrite', () => {
     expect(openclaw.pathRewrites.some(r => r.from === 'CLAUDE.md' && r.to === 'AGENTS.md')).toBe(true);
   });
